@@ -44,6 +44,27 @@ class FeatureAlign(nn.Module):
         aligned = self.relu(aligned)
         return aligned
 
+class UpBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super(UpBlock, self).__init__()
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.conv = nn.Sequential(
+            nn.Conv2d(out_channels + skip_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        # 对齐尺寸，避免 1 像素偏差
+        if x.size() != skip.size():
+            x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
 class MobileNetV2_UNet(nn.Module):
     def __init__(self):
         super(MobileNetV2_UNet, self).__init__()
@@ -75,6 +96,7 @@ class MobileNetV2_UNet(nn.Module):
         #         (18): ConvBNReLU(320, 1280, kernel_size=1)
         #     )
         # )
+        num_classes = 2
         # 加载预训练的MobileNetV2主干网络
         backbone = mobilenet_v2(weights=MobileNet_V2_Weights.IMAGENET1K_V1).features
         self.enc0 = backbone[0]            # Conv+BN+ReLU
@@ -84,34 +106,42 @@ class MobileNetV2_UNet(nn.Module):
         self.enc4 = backbone[10:14]        # 96
         self.enc5 = backbone[14:]          # 1280
 
-        # 特征对齐模块
-        self.align4 = FeatureAlign(96, 96)   # d4 -> e4
-        self.align3 = FeatureAlign(64, 64)   # d3 -> e3
-        self.align2 = FeatureAlign(32, 32)   # d2 -> e2
-        self.align1 = FeatureAlign(24, 24)   # d1 -> e1
-        self.align0 = FeatureAlign(16, 16)   # d0 -> e0
+        # # 特征对齐模块
+        # self.align4 = FeatureAlign(96, 96)   # d4 -> e4
+        # self.align3 = FeatureAlign(64, 64)   # d3 -> e3
+        # self.align2 = FeatureAlign(32, 32)   # d2 -> e2
+        # self.align1 = FeatureAlign(24, 24)   # d1 -> e1
+        # self.align0 = FeatureAlign(16, 16)   # d0 -> e0
 
-        # 解码器：每一步上采样 + concat + 卷积
-        self.up4 = nn.ConvTranspose2d(1280, 96, kernel_size=2, stride=2)
-        self.dec4 = DecoderBlock(96 + 96, 96, 64)
+        # # 解码器：每一步上采样 + concat + 卷积
+        # self.up4 = nn.ConvTranspose2d(1280, 96, kernel_size=2, stride=2)
+        # self.dec4 = DecoderBlock(96 + 96, 96, 64)
 
-        self.up3 = nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2)
-        self.dec3 = DecoderBlock(64 + 64, 64, 32)
+        # self.up3 = nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2)
+        # self.dec3 = DecoderBlock(64 + 64, 64, 32)
 
-        self.up2 = nn.ConvTranspose2d(32, 32, kernel_size=2, stride=2)
-        self.dec2 = DecoderBlock(32 + 32, 32, 24)
+        # self.up2 = nn.ConvTranspose2d(32, 32, kernel_size=2, stride=2)
+        # self.dec2 = DecoderBlock(32 + 32, 32, 24)
 
-        self.up1 = nn.ConvTranspose2d(24, 24, kernel_size=2, stride=2)
-        self.dec1 = DecoderBlock(24 + 24, 24, 16)
+        # self.up1 = nn.ConvTranspose2d(24, 24, kernel_size=2, stride=2)
+        # self.dec1 = DecoderBlock(24 + 24, 24, 16)
 
-        self.up0 = nn.ConvTranspose2d(16, 16, kernel_size=2, stride=2)
-        self.dec0 = DecoderBlock(16 + 32, 16, 8)  # enc0输出是32通道
+        # self.up0 = nn.ConvTranspose2d(16, 16, kernel_size=2, stride=2)
+        # self.dec0 = DecoderBlock(16 + 32, 16, 8)  # enc0输出是32通道
 
-        # 最终上采样：从112x112恢复到224x224
-        self.final_upsample = nn.ConvTranspose2d(8, 8, kernel_size=2, stride=2)
+        # # 最终上采样：从112x112恢复到224x224
+        # self.final_upsample = nn.ConvTranspose2d(8, 8, kernel_size=2, stride=2)
 
-        # 最终输出：通道数为1，sigmoid用于二分类
-        self.final = nn.Conv2d(8, 1, kernel_size=1)
+        # self.final = nn.Conv2d(8, 1, kernel_size=1)
+
+        # 解码器
+        self.up1 = UpBlock(1280, 96, 256)  # 7→14
+        self.up2 = UpBlock(256, 64, 128)   # 14→28
+        self.up3 = UpBlock(128, 32, 64)    # 28→56
+        self.up4 = UpBlock(64, 24, 32)     # 56→112
+        self.up5 = UpBlock(32, 32, 16)     # 112→224
+
+        self.out_conv = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
         # 保存输入尺寸用于最终输出
@@ -126,49 +156,56 @@ class MobileNetV2_UNet(nn.Module):
         e5 = self.enc5(e4)     # [B, 1280, 7, 7]   - 第五次下采样: 14→7
 
         # 解码器部分
-        d4 = self.up4(e5)
-        # 特征对齐：确保d4和e4尺寸匹配
-        if d4.shape[2:] != e4.shape[2:]:
-            d4 = self.align4(d4, e4.shape[2:])
-        d4 = torch.cat([d4, e4], dim=1)
-        d4 = self.dec4(d4)
+        # d4 = self.up4(e5)
+        # if d4.shape[2:] != e4.shape[2:]:
+        #     d4 = self.align4(d4, e4.shape[2:])
+        # d4 = torch.cat([d4, e4], dim=1)
+        # d4 = self.dec4(d4)
 
-        d3 = self.up3(d4)
-        # 特征对齐：确保d3和e3尺寸匹配
-        if d3.shape[2:] != e3.shape[2:]:
-            d3 = self.align3(d3, e3.shape[2:])
-        d3 = torch.cat([d3, e3], dim=1)
-        d3 = self.dec3(d3)
+        # d3 = self.up3(d4)
+        # if d3.shape[2:] != e3.shape[2:]:
+        #     d3 = self.align3(d3, e3.shape[2:])
+        # d3 = torch.cat([d3, e3], dim=1)
+        # d3 = self.dec3(d3)
 
-        d2 = self.up2(d3)
-        # 特征对齐：确保d2和e2尺寸匹配
-        if d2.shape[2:] != e2.shape[2:]:
-            d2 = self.align2(d2, e2.shape[2:])
-        d2 = torch.cat([d2, e2], dim=1)
-        d2 = self.dec2(d2)
+        # d2 = self.up2(d3)
+        # if d2.shape[2:] != e2.shape[2:]:
+        #     d2 = self.align2(d2, e2.shape[2:])
+        # d2 = torch.cat([d2, e2], dim=1)
+        # d2 = self.dec2(d2)
 
-        d1 = self.up1(d2)
-        # 特征对齐：确保d1和e1尺寸匹配
-        if d1.shape[2:] != e1.shape[2:]:
-            d1 = self.align1(d1, e1.shape[2:])
-        d1 = torch.cat([d1, e1], dim=1)
-        d1 = self.dec1(d1)
+        # d1 = self.up1(d2)
+        # if d1.shape[2:] != e1.shape[2:]:
+        #     d1 = self.align1(d1, e1.shape[2:])
+        # d1 = torch.cat([d1, e1], dim=1)
+        # d1 = self.dec1(d1)
 
-        d0 = self.up0(d1)
-        # 特征对齐：确保d0和e0尺寸匹配
-        if d0.shape[2:] != e0.shape[2:]:
-            d0 = self.align0(d0, e0.shape[2:])
-        d0 = torch.cat([d0, e0], dim=1)
-        d0 = self.dec0(d0)
+        # d0 = self.up0(d1)
+        # if d0.shape[2:] != e0.shape[2:]:
+        #     d0 = self.align0(d0, e0.shape[2:])
+        # d0 = torch.cat([d0, e0], dim=1)
+        # d0 = self.dec0(d0)
 
-        # 最终上采样：从112x112恢复到224x224
-        d0 = self.final_upsample(d0)  # [B, 8, 224, 224]
+        # # 最终上采样：从112x112恢复到224x224
+        # d0 = self.final_upsample(d0)  # [B, 8, 224, 224]
 
-        out = self.final(d0)
-        out = torch.sigmoid(out)
+        # out = self.final(d0)
+        # # out = torch.sigmoid(out)
         
-        # # 确保输出尺寸与输入尺寸匹配
-        # if out.shape[2:] != input_size:
-        #     raise ValueError(f"输出尺寸不匹配: {out.shape[2:]} vs 输入 {input_size}")
+        # # # 确保输出尺寸与输入尺寸匹配
+        # # if out.shape[2:] != input_size:
+        # #     raise ValueError(f"输出尺寸不匹配: {out.shape[2:]} vs 输入 {input_size}")
+
+        d1 = self.up1(e5, e4)  # 7→14
+        d2 = self.up2(d1, e3)  # 14→28
+        d3 = self.up3(d2, e2)  # 28→56
+        d4 = self.up4(d3, e1)  # 56→112
+        d5 = self.up5(d4, e0)  # 112→224
+
+        out = self.out_conv(d5)  # [B, num_classes, 224, 224]
+        
+        # Ensure logits match the input spatial size
+        if out.shape[2:] != input_size:
+            out = F.interpolate(out, size=input_size, mode='bilinear', align_corners=False)
         
         return out

@@ -170,8 +170,8 @@ def main():
         return
     
     # 选择测试图像
-    image_path = "freespace_dataset/images/0000.png"
-    mask_path = "freespace_dataset/masks/0000.png"
+    image_path = "freespace_dataset/images/0025.png"
+    mask_path = "freespace_dataset/masks/0025.png"
     
     if not os.path.exists(image_path):
         print(f"❌ 测试图像不存在: {image_path}")

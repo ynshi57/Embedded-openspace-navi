@@ -54,6 +54,13 @@ python3 export_onnx.py
 - **训练Acc**: 0.9947
 - **验证IoU**: 0.8967
 
+### 用法示例
+
+#### 新域占比80%、旧域20%，从最佳权重微调，编码器前2轮冻结：
+```bash
+python3 train.py --old_image_dirs freespace_dataset/images --old_mask_dirs freespace_dataset/masks --new_image_dirs NEW/images --new_mask_dirs NEW/masks --new_ratio 0.8 --resume_from runs/best_model_val_iou.pth --finetune --finetune_lr 1e-5 --freeze_encoder_epochs 2
+```
+
 ## 可视化
 
 ### 模型预测对比

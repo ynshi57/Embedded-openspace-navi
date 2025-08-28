@@ -6,7 +6,9 @@ from model_mobilenet_unet import MobileNetV2_UNet
 from utils import KittiRoadDataset
 import os
 import numpy as np
-from sklearn.model_selection import train_test_split
+import argparse
+from torch.utils.data import ConcatDataset
+from torch.utils.data.sampler import WeightedRandomSampler
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("🚀 使用设备:", device)
@@ -59,30 +61,168 @@ def calculate_pixel_accuracy_logits(pred_logits, target, ignore_index=255):
         return (correct / (total + 1e-6)).item()
 
 
-def train_all_data(total_epochs=50, save_interval=10):
-    """连续训练所有数据，每save_interval轮保存一次，最终只保留一个模型。加入验证划分并保存最佳模型。"""
-    full_dataset = KittiRoadDataset("freespace_dataset/images", "freespace_dataset/masks", augment=True)
-    n = len(full_dataset)
-    indices = list(range(n))
-    # 固定划分 80/20
-    split = int(0.8 * n)
-    train_indices = indices[:split]
-    val_indices = indices[split:]
+def freeze_encoder(model: MobileNetV2_UNet, freeze: bool):
+    for m in [model.enc0, model.enc1, model.enc2, model.enc3, model.enc4, model.enc5]:
+        for p in m.parameters():
+            p.requires_grad = not (not not False) if False else (not False)
+    # 上面只是占位，真正逻辑如下：
+    for m in [model.enc0, model.enc1, model.enc2, model.enc3, model.enc4, model.enc5]:
+        for p in m.parameters():
+            p.requires_grad = not freeze
 
-    train_subset = torch.utils.data.Subset(full_dataset, train_indices)
-    # 验证集不做增强
-    val_dataset = KittiRoadDataset("freespace_dataset/images", "freespace_dataset/masks", augment=False)
-    val_subset = torch.utils.data.Subset(val_dataset, val_indices)
+def build_concat_dataset(image_dirs, mask_dirs, augment: bool):
+    assert len(image_dirs) == len(mask_dirs), "image_dirs 与 mask_dirs 数量需一致"
+    datasets = []
+    for img_dir, msk_dir in zip(image_dirs, mask_dirs):
+        if not os.path.isdir(img_dir) or not os.path.isdir(msk_dir):
+            print(f"跳过无效数据目录: {img_dir} | {msk_dir}")
+            continue
+        ds = KittiRoadDataset(img_dir, msk_dir, augment=augment)
+        if len(ds) == 0:
+            print(f"空数据集: {img_dir} | {msk_dir}")
+            continue
+        print(f"加载数据集: {img_dir} ({len(ds)} 张)")
+        datasets.append(ds)
+    if len(datasets) == 0:
+        raise ValueError("未找到有效的数据集目录")
+    return ConcatDataset(datasets)
 
-    train_loader = DataLoader(train_subset, batch_size=4, shuffle=True)
-    val_loader = DataLoader(val_subset, batch_size=4, shuffle=False)
-    
-    print(f"📊 训练集: {len(train_subset)} 张 | 验证集: {len(val_subset)} 张")
+def build_group_datasets(old_imgs, old_msks, new_imgs, new_msks):
+    """返回: (train_old, val_old, train_new, val_new) 按各自80/20划分"""
+    train_old = val_old = train_new = val_new = None
+    if old_imgs and old_msks:
+        full_old_aug = build_concat_dataset(old_imgs, old_msks, augment=True)
+        n_old = len(full_old_aug)
+        idx_old = list(range(n_old))
+        split_old = int(0.8 * n_old)
+        train_old = torch.utils.data.Subset(full_old_aug, idx_old[:split_old])
+        full_old_noaug = build_concat_dataset(old_imgs, old_msks, augment=False)
+        val_old = torch.utils.data.Subset(full_old_noaug, idx_old[split_old:])
+    if new_imgs and new_msks:
+        full_new_aug = build_concat_dataset(new_imgs, new_msks, augment=True)
+        n_new = len(full_new_aug)
+        idx_new = list(range(n_new))
+        split_new = int(0.8 * n_new)
+        train_new = torch.utils.data.Subset(full_new_aug, idx_new[:split_new])
+        full_new_noaug = build_concat_dataset(new_imgs, new_msks, augment=False)
+        val_new = torch.utils.data.Subset(full_new_noaug, idx_new[split_new:])
+    return train_old, val_old, train_new, val_new
 
-    best_val_iou = -1.0
-    best_epoch = 0
+def train_all_data(total_epochs=50, save_interval=10, resume_from: str = None, resume_optimizer: bool = True,
+                   finetune: bool = False, finetune_lr: float = 1e-5, freeze_encoder_epochs: int = 0,
+                   image_dirs=None, mask_dirs=None,
+                   old_image_dirs=None, old_mask_dirs=None, new_image_dirs=None, new_mask_dirs=None,
+                   new_ratio: float = 0.8):
+    """连续训练所有数据，每save_interval轮保存一次，最终只保留一个模型。加入验证划分并保存最佳模型。
+    支持增量训练：
+      - resume_from: 路径，加载检查点继续训练（可恢复优化器）
+      - finetune: 仅加载权重，重建优化器并用较小lr；可在前若干epoch冻结encoder
+      - image_dirs/mask_dirs: 传入多个数据目录以混合训练（旧+新）
+      - old/new_* + new_ratio: 分别指定旧域和新域数据，按比例采样混合训练，分别汇报验证指标
+    """
+    # 处理增量训练/微调
+    start_epoch = 0
+    if resume_from:
+        if os.path.exists(resume_from):
+            ckpt = torch.load(resume_from, map_location=device)
+            if 'model_state_dict' in ckpt:
+                model.load_state_dict(ckpt['model_state_dict'])
+            else:
+                model.load_state_dict(ckpt)
+            if finetune:
+                for g in optimizer.param_groups:
+                    g['lr'] = finetune_lr
+                print(f"微调模式: 仅加载权重，重置优化器LR={finetune_lr}")
+            else:
+                if resume_optimizer and 'optimizer_state_dict' in ckpt:
+                    try:
+                        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                        print("断点续训: 已恢复优化器状态")
+                    except Exception as e:
+                        print(f"优化器状态恢复失败: {e}")
+                if 'epoch' in ckpt:
+                    start_epoch = int(ckpt['epoch'])
+                elif 'final_epoch' in ckpt:
+                    start_epoch = int(ckpt['final_epoch'])
+                else:
+                    start_epoch = 0
+                print(f"从第 {start_epoch+1} 轮继续训练")
+        else:
+            print(f"resume_from 路径不存在: {resume_from}，将从头训练")
 
-    for epoch in range(total_epochs):
+    # 数据集构建
+    # 优先使用 old/new 分组；若未提供，则回退到 image_dirs/mask_dirs；再回退到默认 freespace_dataset
+    if (old_image_dirs and old_mask_dirs) or (new_image_dirs and new_mask_dirs):
+        train_old, val_old, train_new, val_new = build_group_datasets(old_image_dirs, old_mask_dirs, new_image_dirs, new_mask_dirs)
+        train_parts = []
+        val_parts = []
+        n_old = len(train_old) if train_old is not None else 0
+        n_new = len(train_new) if train_new is not None else 0
+        if train_old is not None:
+            train_parts.append(train_old)
+        if train_new is not None:
+            train_parts.append(train_new)
+        if len(train_parts) == 0:
+            raise ValueError("未提供有效的训练数据")
+        train_mixed = ConcatDataset(train_parts)
+        # 验证集：分别保留
+        val_mixed = None
+        if val_old is not None and val_new is not None:
+            val_mixed = ConcatDataset([val_old, val_new])
+        elif val_old is not None:
+            val_mixed = val_old
+        elif val_new is not None:
+            val_mixed = val_new
+        # 采样权重：按 new_ratio 对新域采样倾斜
+        sample_weights = []
+        for i in range(len(train_mixed)):
+            # ConcatDataset将子集顺序拼接：先old后new（若两者都存在且按上述append顺序）
+            if train_old is not None and i < len(train_old):
+                # old
+                w = max(1e-6, (1.0 - new_ratio) / max(1, n_old))
+            else:
+                # new
+                w = max(1e-6, new_ratio / max(1, n_new))
+            sample_weights.append(w)
+        sampler = WeightedRandomSampler(weights=torch.DoubleTensor(sample_weights), num_samples=len(train_mixed), replacement=True)
+        train_loader = DataLoader(train_mixed, batch_size=4, sampler=sampler)
+        val_loader_mixed = DataLoader(val_mixed, batch_size=4, shuffle=False) if val_mixed is not None else None
+        val_loader_old = DataLoader(val_old, batch_size=4, shuffle=False) if val_old is not None else None
+        val_loader_new = DataLoader(val_new, batch_size=4, shuffle=False) if val_new is not None else None
+        total_train = len(train_mixed)
+        total_val = len(val_mixed) if val_mixed is not None else 0
+        print(f"📊 训练集(混合): {total_train} 张 | 验证(混合): {total_val} 张 | 验证(旧): {len(val_old) if val_old else 0} | 验证(新): {len(val_new) if val_new else 0}")
+    else:
+        # 回退：原先混合列表或默认数据
+        if not image_dirs:
+            image_dirs = ["freespace_dataset/images"]
+        if not mask_dirs:
+            mask_dirs = ["freespace_dataset/masks"]
+        full_dataset = build_concat_dataset(image_dirs, mask_dirs, augment=True)
+        n = len(full_dataset)
+        indices = list(range(n))
+        split = int(0.8 * n)
+        train_indices = indices[:split]
+        val_indices = indices[split:]
+        train_subset = torch.utils.data.Subset(full_dataset, train_indices)
+        val_full = build_concat_dataset(image_dirs, mask_dirs, augment=False)
+        val_subset = torch.utils.data.Subset(val_full, val_indices)
+        train_loader = DataLoader(train_subset, batch_size=4, shuffle=True)
+        val_loader_mixed = DataLoader(val_subset, batch_size=4, shuffle=False)
+        val_loader_old = None
+        val_loader_new = None
+        print(f"📊 训练集: {len(train_subset)} 张 | 验证集: {len(val_subset)} 张 (总计: {n})")
+
+    best_val_iou_mixed = -1.0
+
+    for epoch in range(start_epoch, total_epochs):
+        if freeze_encoder_epochs > 0 and (epoch - start_epoch) < freeze_encoder_epochs:
+            freeze_encoder(model, True)
+            if (epoch - start_epoch) == 0:
+                print(f"🧊 冻结Encoder参数 {freeze_encoder_epochs} 个epoch 以稳定微调")
+        else:
+            freeze_encoder(model, False)
+
         model.train()
         epoch_loss = 0.0
         epoch_iou = 0.0
@@ -91,19 +231,15 @@ def train_all_data(total_epochs=50, save_interval=10):
         
         for batch_idx, (images, masks) in enumerate(train_loader):
             images, masks = images.to(device), masks.to(device)
-            
             preds = model(images)
             loss = criterion(preds, masks)
-            
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
             with torch.no_grad():
                 iou = calculate_iou_logits(preds, masks)
                 dice = calculate_dice_logits(preds, masks)
                 acc = calculate_pixel_accuracy_logits(preds, masks)
-            
             epoch_loss += loss.item()
             epoch_iou += iou
             epoch_dice += dice
@@ -115,37 +251,36 @@ def train_all_data(total_epochs=50, save_interval=10):
         avg_acc = epoch_acc / len(train_loader)
 
         # 验证
-        model.eval()
-        val_iou = 0.0
-        val_dice = 0.0
-        val_acc = 0.0
-        val_loss = 0.0
-        with torch.no_grad():
-            for images, masks in val_loader:
-                images, masks = images.to(device), masks.to(device)
-                preds = model(images)
-                loss = criterion(preds, masks)
-                val_loss += loss.item()
-                val_iou += calculate_iou_logits(preds, masks)
-                val_dice += calculate_dice_logits(preds, masks)
-                val_acc += calculate_pixel_accuracy_logits(preds, masks)
-        if len(val_loader) > 0:
-            val_loss /= len(val_loader)
-            val_iou /= len(val_loader)
-            val_dice /= len(val_loader)
-            val_acc /= len(val_loader)
-        else:
-            val_loss = float('nan')
-            val_iou = float('nan')
-            val_dice = float('nan')
-            val_acc = float('nan')
-        
-        print(f"[{epoch+1}/{total_epochs}] Train Loss: {avg_loss:.4f} | IoU: {avg_iou:.4f} | Dice: {avg_dice:.4f} | Acc: {avg_acc:.4f} || Val Loss: {val_loss:.4f} | Val IoU: {val_iou:.4f} | Val Dice: {val_dice:.4f} | Val Acc: {val_acc:.4f}")
+        def eval_loader(dl):
+            if dl is None or len(dl) == 0:
+                return float('nan'), float('nan'), float('nan'), float('nan')
+            viou = vdice = vacc = vloss = 0.0
+            with torch.no_grad():
+                for images, masks in dl:
+                    images, masks = images.to(device), masks.to(device)
+                    preds = model(images)
+                    loss = criterion(preds, masks)
+                    vloss += loss.item()
+                    viou += calculate_iou_logits(preds, masks)
+                    vdice += calculate_dice_logits(preds, masks)
+                    vacc += calculate_pixel_accuracy_logits(preds, masks)
+            n = len(dl)
+            return vloss / n, viou / n, vdice / n, vacc / n
 
-        # 保存最佳
-        if not np.isnan(val_iou) and val_iou > best_val_iou:
-            best_val_iou = val_iou
-            best_epoch = epoch + 1
+        val_loss_m, val_iou_m, val_dice_m, val_acc_m = eval_loader(val_loader_mixed)
+        val_loss_o, val_iou_o, val_dice_o, val_acc_o = eval_loader(val_loader_old)
+        val_loss_n, val_iou_n, val_dice_n, val_acc_n = eval_loader(val_loader_new)
+        
+        print(f"[{epoch+1}/{total_epochs}] Train Loss: {avg_loss:.4f} | IoU: {avg_iou:.4f} | Dice: {avg_dice:.4f} | Acc: {avg_acc:.4f}")
+        print(f"                 Val(mix) Loss: {val_loss_m:.4f} | IoU: {val_iou_m:.4f} | Dice: {val_dice_m:.4f} | Acc: {val_acc_m:.4f}")
+        if not np.isnan(val_iou_o):
+            print(f"                 Val(old) Loss: {val_loss_o:.4f} | IoU: {val_iou_o:.4f} | Dice: {val_dice_o:.4f} | Acc: {val_acc_o:.4f}")
+        if not np.isnan(val_iou_n):
+            print(f"                 Val(new) Loss: {val_loss_n:.4f} | IoU: {val_iou_n:.4f} | Dice: {val_dice_n:.4f} | Acc: {val_acc_n:.4f}")
+
+        # 保存最佳（以混合验证IoU为准）
+        if not np.isnan(val_iou_m) and val_iou_m > best_val_iou_mixed:
+            best_val_iou_mixed = val_iou_m
             os.makedirs("runs", exist_ok=True)
             best_path = "runs/best_model_val_iou.pth"
             torch.save({
@@ -158,16 +293,27 @@ def train_all_data(total_epochs=50, save_interval=10):
                     'dice': avg_dice,
                     'acc': avg_acc
                 },
-                'val_metrics': {
-                    'loss': val_loss,
-                    'iou': val_iou,
-                    'dice': val_dice,
-                    'acc': val_acc
+                'val_mixed': {
+                    'loss': val_loss_m,
+                    'iou': val_iou_m,
+                    'dice': val_dice_m,
+                    'acc': val_acc_m
+                },
+                'val_old': {
+                    'loss': val_loss_o,
+                    'iou': val_iou_o,
+                    'dice': val_dice_o,
+                    'acc': val_acc_o
+                },
+                'val_new': {
+                    'loss': val_loss_n,
+                    'iou': val_iou_n,
+                    'dice': val_dice_n,
+                    'acc': val_acc_n
                 }
             }, best_path)
-            print(f"🏆 更新最佳模型(Val IoU={val_iou:.4f}) → {best_path}")
+            print(f"🏆 更新最佳模型(Val-mix IoU={val_iou_m:.4f}) → {best_path}")
         
-        # 周期性保存
         if (epoch + 1) % save_interval == 0:
             os.makedirs("runs", exist_ok=True)
             checkpoint_path = f"runs/checkpoint_epoch_{epoch+1}.pth"
@@ -179,10 +325,24 @@ def train_all_data(total_epochs=50, save_interval=10):
                 'iou': avg_iou,
                 'dice': avg_dice,
                 'acc': avg_acc,
-                'val_loss': val_loss,
-                'val_iou': val_iou,
-                'val_dice': val_dice,
-                'val_acc': val_acc
+                'val_mixed': {
+                    'loss': val_loss_m,
+                    'iou': val_iou_m,
+                    'dice': val_dice_m,
+                    'acc': val_acc_m
+                },
+                'val_old': {
+                    'loss': val_loss_o,
+                    'iou': val_iou_o,
+                    'dice': val_dice_o,
+                    'acc': val_acc_o
+                },
+                'val_new': {
+                    'loss': val_loss_n,
+                    'iou': val_iou_n,
+                    'dice': val_dice_n,
+                    'acc': val_acc_n
+                }
             }, checkpoint_path)
             print(f"💾 保存检查点: {checkpoint_path}")
 
@@ -192,28 +352,29 @@ def train_all_data(total_epochs=50, save_interval=10):
     torch.save({
         'final_epoch': total_epochs,
         'model_state_dict': model.state_dict(),
-        'best_val_iou': best_val_iou,
-        'best_epoch': best_epoch,
+        'best_val_iou_mixed': best_val_iou_mixed,
         'final_metrics': {
             'loss': avg_loss,
             'iou': avg_iou,
             'dice': avg_dice,
             'acc': avg_acc,
-            'val_loss': val_loss,
-            'val_iou': val_iou,
-            'val_dice': val_dice,
-            'val_acc': val_acc
+            'val_mixed_iou': val_iou_m,
+            'val_old_iou': val_iou_o,
+            'val_new_iou': val_iou_n
         }
     }, final_model_path)
 
     print(f"\n🎉 训练完成！")
     print(f"📁 最终模型: {final_model_path}")
-    print(f"🏆 最佳验证IoU: {best_val_iou:.4f} (第{best_epoch}轮)")
+    print(f"🏆 最佳混合验证IoU: {best_val_iou_mixed:.4f}")
     print(f"📊 最终指标:")
     print(f"   Train Loss: {avg_loss:.4f} | IoU: {avg_iou:.4f} | Dice: {avg_dice:.4f} | Acc: {avg_acc:.4f}")
-    print(f"   Val   Loss: {val_loss:.4f} | IoU: {val_iou:.4f} | Dice: {val_dice:.4f} | Acc: {val_acc:.4f}")
+    print(f"   Val(mix)  Loss: {val_loss_m:.4f} | IoU: {val_iou_m:.4f} | Dice: {val_dice_m:.4f} | Acc: {val_acc_m:.4f}")
+    if not np.isnan(val_iou_o):
+        print(f"   Val(old)  Loss: {val_loss_o:.4f} | IoU: {val_iou_o:.4f} | Dice: {val_dice_o:.4f} | Acc: {val_acc_o:.4f}")
+    if not np.isnan(val_iou_n):
+        print(f"   Val(new)  Loss: {val_loss_n:.4f} | IoU: {val_iou_n:.4f} | Dice: {val_dice_n:.4f} | Acc: {val_acc_n:.4f}")
 
-    # 清理旧的周期性检查点（可选）
     for i in range(save_interval, total_epochs + 1, save_interval):
         checkpoint_path = f"runs/checkpoint_epoch_{i}.pth"
         if os.path.exists(checkpoint_path):
@@ -224,5 +385,61 @@ def train_all_data(total_epochs=50, save_interval=10):
 
 # 开始训练
 if __name__ == "__main__":
-    # 训练50轮，每10轮保存一次检查点
-    final_model = train_all_data(total_epochs=50, save_interval=10)
+    parser = argparse.ArgumentParser()
+    # 训练总轮数（默认50）。增量/微调场景下一样生效：会从起始epoch继续到该轮数
+    parser.add_argument('--epochs', type=int, default=50)
+    # 周期性保存间隔（单位：epoch）。仅用于中途检查点；训练结束会清理这些检查点
+    parser.add_argument('--save_interval', type=int, default=10)
+    # 恢复训练/微调的权重路径（.pth）。可为 runs/best_model_val_iou.pth 或自定义
+    parser.add_argument('--resume_from', type=str, default=None, help='checkpoint path to resume/finetune from')
+    # 是否在断点续训时一并恢复优化器状态（动量/学习率等）。仅断点续训建议开启，微调一般关闭
+    parser.add_argument('--resume_optimizer', action='store_true', help='resume optimizer state when resuming')
+    # 微调模式：仅加载模型权重，重建优化器，以较小学习率在新数据上继续训练
+    parser.add_argument('--finetune', action='store_true', help='finetune on new data (load weights only)')
+    # 微调学习率（默认1e-5）。与 --finetune 搭配使用
+    parser.add_argument('--finetune_lr', type=float, default=1e-5, help='lr for finetune')
+    # 微调时可先冻结编码器若干轮（默认0），稳定特征再解冻。典型设置：2~5
+    parser.add_argument('--freeze_encoder_epochs', type=int, default=0, help='freeze encoder for first N epochs')
+    # 统一混合训练模式：可传入多个图像/掩码目录进行合并训练（未提供 old/new 时生效）
+    parser.add_argument('--image_dirs', nargs='+', type=str, default=None, help='one or more image directories')
+    parser.add_argument('--mask_dirs', nargs='+', type=str, default=None, help='one or more mask directories')
+    # 分域混合训练：分别指定旧域与新域数据目录，用于“新数据为主+旧数据回放”的持续学习范式
+    parser.add_argument('--old_image_dirs', nargs='+', type=str, default=None, help='old domain image dirs')
+    parser.add_argument('--old_mask_dirs', nargs='+', type=str, default=None, help='old domain mask dirs')
+    parser.add_argument('--new_image_dirs', nargs='+', type=str, default=None, help='new domain image dirs')
+    parser.add_argument('--new_mask_dirs', nargs='+', type=str, default=None, help='new domain mask dirs')
+    # 新域采样占比（0~1，默认0.8）。仅在提供 old/new 目录时生效，用于加权采样新域样本
+    parser.add_argument('--new_ratio', type=float, default=0.8, help='sampling ratio for new domain in training (0~1)')
+
+    # 使用示例：
+    # 1) 断点续训（同一数据继续训练，恢复优化器）
+    #    python3 train.py --epochs 50 \
+    #        --resume_from runs/best_model_val_iou.pth --resume_optimizer
+    # 2) 新数据微调（小学习率 + 冻结编码器前2轮），新域占比80%，混入旧数据回放20%
+    #    python3 train.py \
+    #        --old_image_dirs freespace_dataset/images \
+    #        --old_mask_dirs freespace_dataset/masks \
+    #        --new_image_dirs NEW/images \
+    #        --new_mask_dirs NEW/masks \
+    #        --new_ratio 0.8 \
+    #        --resume_from runs/best_model_val_iou.pth \
+    #        --finetune --finetune_lr 1e-5 --freeze_encoder_epochs 2
+
+    args = parser.parse_args()
+
+    final_model = train_all_data(
+        total_epochs=args.epochs,
+        save_interval=args.save_interval,
+        resume_from=args.resume_from,
+        resume_optimizer=args.resume_optimizer,
+        finetune=args.finetune,
+        finetune_lr=args.finetune_lr,
+        freeze_encoder_epochs=args.freeze_encoder_epochs,
+        image_dirs=args.image_dirs,
+        mask_dirs=args.mask_dirs,
+        old_image_dirs=args.old_image_dirs,
+        old_mask_dirs=args.old_mask_dirs,
+        new_image_dirs=args.new_image_dirs,
+        new_mask_dirs=args.new_mask_dirs,
+        new_ratio=args.new_ratio,
+    )

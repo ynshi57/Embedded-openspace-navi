@@ -91,7 +91,3 @@ python3 export_onnx.py
 - 支持ignore_index忽略无效像素
 
 ---
-
-**作者**: yaonan （weixin: saymorething）
-
-![颜值](source/author.png)

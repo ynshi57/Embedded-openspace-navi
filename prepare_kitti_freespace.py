@@ -10,7 +10,7 @@ KITTI_URL = "https://s3.eu-central-1.amazonaws.com/avg-kitti/data_road.zip"
 ZIP_NAME = "kitti_road.zip"
 EXTRACT_DIR = "kitti_road"
 OUTPUT_DIR = "freespace_dataset"
-NUM_SAMPLES = 50  # 你可以改为50或更多
+NUM_SAMPLES = 100  # 你可以改为50或更多
 
 def download_kitti(url, save_path):
     if os.path.exists(save_path):

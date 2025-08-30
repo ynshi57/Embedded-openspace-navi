@@ -50,7 +50,7 @@ def calculate_dice_logits(pred_logits, target, ignore_index=255, foreground_clas
 # 像素准确率（忽略255）
 def calculate_pixel_accuracy_logits(pred_logits, target, ignore_index=255):
     with torch.no_grad():
-        pred = torch.argmax(pred_logits, dim=1)
+        pred = torch.argmax(pred_logits, dim=1) # 返回每一行最大值的索引，dim=0表示列
         valid = target != ignore_index
         if valid.sum() == 0:
             return 0.0
@@ -225,4 +225,4 @@ def train_all_data(total_epochs=50, save_interval=10):
 # 开始训练
 if __name__ == "__main__":
     # 训练50轮，每10轮保存一次检查点
-    final_model = train_all_data(total_epochs=50, save_interval=10)
+    final_model = train_all_data(total_epochs=30, save_interval=10)

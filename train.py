@@ -13,9 +13,56 @@ from torch.utils.data.sampler import WeightedRandomSampler
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("🚀 使用设备:", device)
 
-# 初始化模型和优化器
+# 初始化模型
 model = MobileNetV2_UNet().to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+def create_optimizer_with_different_lr(model, encoder_lr=1e-5, decoder_lr=1e-4, weight_decay=0):
+    """创建分层学习率的优化器
+    
+    Args:
+        model: MobileNetV2_UNet模型
+        encoder_lr: 编码器学习率（预训练部分，较小）
+        decoder_lr: 解码器学习率（新训练部分，较大）
+        weight_decay: 权重衰减
+    
+    Returns:
+        optimizer: 配置好的优化器
+    """
+    encoder_params = []
+    decoder_params = []
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad:  # 只处理需要梯度的参数
+            if 'enc' in name:  # 编码器参数
+                encoder_params.append(param)
+            else:  # 解码器参数（up1, up2, up3, up4, final_up, out_conv）
+                decoder_params.append(param)
+    
+    param_groups = []
+    
+    if encoder_params:
+        param_groups.append({
+            'params': encoder_params,
+            'lr': encoder_lr,
+            'weight_decay': weight_decay
+        })
+        print(f"编码器参数组: {len(encoder_params)} 个参数, LR={encoder_lr}")
+    
+    if decoder_params:
+        param_groups.append({
+            'params': decoder_params,
+            'lr': decoder_lr,
+            'weight_decay': weight_decay
+        })
+        print(f"解码器参数组: {len(decoder_params)} 个参数, LR={decoder_lr}")
+    
+    # 创建优化器
+    optimizer = torch.optim.Adam(param_groups)
+    return optimizer
+
+# 创建优化器（默认配置）
+optimizer = create_optimizer_with_different_lr(model)
+
 # criterion = nn.BCELoss()
 criterion = nn.CrossEntropyLoss(ignore_index=255)
 
@@ -112,11 +159,11 @@ def train_all_data(total_epochs=50, save_interval=10, resume_from: str = None, r
                    finetune: bool = False, finetune_lr: float = 1e-5, freeze_encoder_epochs: int = 0,
                    image_dirs=None, mask_dirs=None,
                    old_image_dirs=None, old_mask_dirs=None, new_image_dirs=None, new_mask_dirs=None,
-                   new_ratio: float = 0.8):
-    """连续训练所有数据，每save_interval轮保存一次，最终只保留一个模型。加入验证划分并保存最佳模型。
+                   new_ratio: float = 0.8, encoder_lr: float = 1e-5, decoder_lr: float = 1e-4, weight_decay: float = 0):
+    """连续训练所有数据, 每save_interval轮保存一次, 最终只保留一个模型。加入验证划分并保存最佳模型。
     支持增量训练：
-      - resume_from: 路径，加载检查点继续训练（可恢复优化器）
-      - finetune: 仅加载权重，重建优化器并用较小lr；可在前若干epoch冻结encoder
+      - resume_from: 路径，加载检查点继续训练
+      - finetune: 仅加载权重,重建优化器并用较小lr, 可在前若干epoch冻结encoder
       - image_dirs/mask_dirs: 传入多个数据目录以混合训练（旧+新）
       - old/new_* + new_ratio: 分别指定旧域和新域数据，按比例采样混合训练，分别汇报验证指标
     """
@@ -129,17 +176,35 @@ def train_all_data(total_epochs=50, save_interval=10, resume_from: str = None, r
                 model.load_state_dict(ckpt['model_state_dict'])
             else:
                 model.load_state_dict(ckpt)
+            
+            # 重新创建优化器（使用分层学习率）
             if finetune:
-                for g in optimizer.param_groups:
-                    g['lr'] = finetune_lr
-                print(f"微调模式: 仅加载权重，重置优化器LR={finetune_lr}")
+                # 微调模式：使用更小的学习率
+                optimizer = create_optimizer_with_different_lr(
+                    model, 
+                    encoder_lr=finetune_lr * 0.1,  # 编码器更小学习率
+                    decoder_lr=finetune_lr,        # 解码器使用指定学习率
+                    weight_decay=weight_decay
+                )
+                print(f"微调模式: 仅加载权重, 重新创建优化器")
+                print(f"  编码器LR: {finetune_lr * 0.1}, 解码器LR: {finetune_lr}")
             else:
+                # 断点续训：使用正常学习率
+                optimizer = create_optimizer_with_different_lr(
+                    model, 
+                    encoder_lr=encoder_lr, 
+                    decoder_lr=decoder_lr, 
+                    weight_decay=weight_decay
+                )
+                
                 if resume_optimizer and 'optimizer_state_dict' in ckpt:
                     try:
                         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
                         print("断点续训: 已恢复优化器状态")
                     except Exception as e:
                         print(f"优化器状态恢复失败: {e}")
+                        print("将使用新的优化器配置继续训练")
+                
                 if 'epoch' in ckpt:
                     start_epoch = int(ckpt['epoch'])
                 elif 'final_epoch' in ckpt:
@@ -149,6 +214,21 @@ def train_all_data(total_epochs=50, save_interval=10, resume_from: str = None, r
                 print(f"从第 {start_epoch+1} 轮继续训练")
         else:
             print(f"resume_from 路径不存在: {resume_from}，将从头训练")
+            # 从头训练：创建新的优化器
+            optimizer = create_optimizer_with_different_lr(
+                model, 
+                encoder_lr=encoder_lr, 
+                decoder_lr=decoder_lr, 
+                weight_decay=weight_decay
+            )
+    else:
+        # 从头训练：创建新的优化器
+        optimizer = create_optimizer_with_different_lr(
+            model, 
+            encoder_lr=encoder_lr, 
+            decoder_lr=decoder_lr, 
+            weight_decay=weight_decay
+        )
 
     # 数据集构建
     # 优先使用 old/new 分组；若未提供，则回退到 image_dirs/mask_dirs；再回退到默认 freespace_dataset
@@ -419,6 +499,11 @@ if __name__ == "__main__":
     
     # 新域采样占比（0~1，默认0.8）。仅在提供 old/new 目录时生效，用于加权采样新域样本
     parser.add_argument('--new_ratio', type=float, default=0.8, help='sampling ratio for new domain in training (0~1)')
+    
+    # 分层学习率参数
+    parser.add_argument('--encoder_lr', type=float, default=1e-5, help='learning rate for encoder (pretrained parts)')
+    parser.add_argument('--decoder_lr', type=float, default=1e-4, help='learning rate for decoder (new training parts)')
+    parser.add_argument('--weight_decay', type=float, default=0, help='weight decay for all parameters')
 
     # 使用示例：
     # 1) 断点续训（同一数据继续训练，恢复优化器）
@@ -433,6 +518,14 @@ if __name__ == "__main__":
     #        --new_ratio 0.8 \
     #        --resume_from runs/best_model_val_iou.pth \
     #        --finetune --finetune_lr 1e-5 --freeze_encoder_epochs 2
+    # 3) 分层学习率训练（编码器小学习率，解码器大学习率）
+    #    python3 train.py --epochs 50 \
+    #        --encoder_lr 1e-5 --decoder_lr 1e-4 --weight_decay 1e-4
+    # 4) 微调时使用分层学习率
+    #    python3 train.py --epochs 30 \
+    #        --resume_from runs/best_model_val_iou.pth \
+    #        --finetune --finetune_lr 1e-5 \
+    #        --encoder_lr 1e-6 --decoder_lr 1e-5 --weight_decay 1e-4
 
     args = parser.parse_args()
 
@@ -451,4 +544,7 @@ if __name__ == "__main__":
         new_image_dirs=args.new_image_dirs,
         new_mask_dirs=args.new_mask_dirs,
         new_ratio=args.new_ratio,
+        encoder_lr=args.encoder_lr,
+        decoder_lr=args.decoder_lr,
+        weight_decay=args.weight_decay,
     )

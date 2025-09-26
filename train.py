@@ -9,12 +9,22 @@ import numpy as np
 import argparse
 from torch.utils.data import ConcatDataset
 from torch.utils.data.sampler import WeightedRandomSampler
+import datetime
+import json
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("🚀 使用设备:", device)
 
 # 初始化模型
 model = MobileNetV2_UNet().to(device)
+
+# 保存每次train的模型指标
+def _append_model_record(record: dict):
+    os.makedirs("runs", exist_ok=True)
+    record["ts_utc"] = datetime.datetime.utcnow().isoformat() + "Z"
+    log_path = os.path.join("runs", "model_indicator_record.log")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 def create_optimizer_with_different_lr(model, encoder_lr=1e-5, decoder_lr=1e-4, weight_decay=0):
     """创建分层学习率的优化器
@@ -61,7 +71,7 @@ def create_optimizer_with_different_lr(model, encoder_lr=1e-5, decoder_lr=1e-4, 
     return optimizer
 
 # 创建优化器（默认配置）
-optimizer = create_optimizer_with_different_lr(model)
+# optimizer = create_optimizer_with_different_lr(model)
 
 # criterion = nn.BCELoss()
 criterion = nn.CrossEntropyLoss(ignore_index=255)
@@ -80,8 +90,8 @@ def calculate_iou_logits(pred_logits, target, num_classes=2, ignore_index=255, f
         target_fg = (target == foreground_class) & valid
         intersection = (pred_fg & target_fg).sum().float()
         union = (pred_fg | target_fg).sum().float()
-        iou = intersection / (union + 1e-6)
-        return iou.item()
+    iou = intersection / (union + 1e-6)
+    return iou.item()
 
 # Dice系数（针对前景类）
 def calculate_dice_logits(pred_logits, target, ignore_index=255, foreground_class=1):
@@ -94,7 +104,7 @@ def calculate_dice_logits(pred_logits, target, ignore_index=255, foreground_clas
         target_fg = (target == foreground_class) & valid
         intersection = (pred_fg & target_fg).sum().float()
         dice = (2 * intersection) / (pred_fg.sum().float() + target_fg.sum().float() + 1e-6)
-        return dice.item()
+    return dice.item()
 
 # 像素准确率（忽略255）
 def calculate_pixel_accuracy_logits(pred_logits, target, ignore_index=255):
@@ -271,6 +281,7 @@ def train_all_data(total_epochs=50, save_interval=10, resume_from: str = None, r
         val_loader_new = DataLoader(val_new, batch_size=4, shuffle=False) if val_new is not None else None
         total_train = len(train_mixed)
         total_val = len(val_mixed) if val_mixed is not None else 0
+        train_size, val_size = total_train, total_val
         print(f"📊 训练集(混合): {total_train} 张 | 验证(混合): {total_val} 张 | 验证(旧): {len(val_old) if val_old else 0} | 验证(新): {len(val_new) if val_new else 0}")
     else:
         # 回退：原先混合列表或默认数据
@@ -291,6 +302,7 @@ def train_all_data(total_epochs=50, save_interval=10, resume_from: str = None, r
         val_loader_mixed = DataLoader(val_subset, batch_size=4, shuffle=False)
         val_loader_old = None
         val_loader_new = None
+        train_size, val_size = len(train_subset), len(val_subset)
         print(f"📊 训练集: {len(train_subset)} 张 | 验证集: {len(val_subset)} 张 (总计: {n})")
 
     best_val_iou_mixed = -1.0
@@ -393,6 +405,29 @@ def train_all_data(total_epochs=50, save_interval=10, resume_from: str = None, r
                 }
             }, best_path)
             print(f"🏆 更新最佳模型(Val-mix IoU={val_iou_m:.4f}) → {best_path}")
+            # 记录日志（最佳）
+            current_lrs = [pg.get('lr', None) for pg in optimizer.param_groups]
+            _append_model_record({
+                'event': 'best_model_updated',
+                'epoch': epoch + 1,
+                'paths': {'best_model': best_path, 'resume_from': resume_from},
+                'train_size': train_size,
+                'val_size': val_size,
+                'train_metrics': {'loss': avg_loss, 'iou': avg_iou, 'dice': avg_dice, 'acc': avg_acc},
+                'val_mixed': {'loss': val_loss_m, 'iou': val_iou_m, 'dice': val_dice_m, 'acc': val_acc_m},
+                'val_old': {'loss': val_loss_o, 'iou': val_iou_o, 'dice': val_dice_o, 'acc': val_acc_o},
+                'val_new': {'loss': val_loss_n, 'iou': val_iou_n, 'dice': val_dice_n, 'acc': val_acc_n},
+                'hparams': {
+                    'encoder_lr': current_lrs[0] if len(current_lrs) > 0 else None,
+                    'decoder_lr': current_lrs[1] if len(current_lrs) > 1 else None,
+                    'weight_decay': optimizer.param_groups[0].get('weight_decay', None) if len(optimizer.param_groups) > 0 else None,
+                    'finetune': finetune,
+                    'freeze_encoder_epochs': freeze_encoder_epochs,
+                    'new_ratio': new_ratio,
+                    'total_epochs': total_epochs,
+                    'save_interval': save_interval
+                }
+            })
         
         if (epoch + 1) % save_interval == 0:
             os.makedirs("runs", exist_ok=True)
@@ -425,7 +460,7 @@ def train_all_data(total_epochs=50, save_interval=10, resume_from: str = None, r
                 }
             }, checkpoint_path)
             print(f"💾 保存检查点: {checkpoint_path}")
-
+    
     # 训练完成，保存最终模型
     os.makedirs("runs", exist_ok=True)
     final_model_path = "runs/freespace_model.pth"
@@ -443,7 +478,7 @@ def train_all_data(total_epochs=50, save_interval=10, resume_from: str = None, r
             'val_new_iou': val_iou_n
         }
     }, final_model_path)
-
+    
     print(f"\n🎉 训练完成！")
     print(f"📁 最终模型: {final_model_path}")
     print(f"🏆 最佳混合验证IoU: {best_val_iou_mixed:.4f}")
@@ -455,6 +490,31 @@ def train_all_data(total_epochs=50, save_interval=10, resume_from: str = None, r
     if not np.isnan(val_iou_n):
         print(f"   Val(new)  Loss: {val_loss_n:.4f} | IoU: {val_iou_n:.4f} | Dice: {val_dice_n:.4f} | Acc: {val_acc_n:.4f}")
 
+    # 记录日志（最终）
+    current_lrs = [pg.get('lr', None) for pg in optimizer.param_groups]
+    _append_model_record({
+        'event': 'final_model_saved',
+        'epoch': total_epochs,
+        'paths': {'final_model': final_model_path, 'best_model': os.path.join('runs', 'best_model_val_iou.pth'), 'resume_from': resume_from},
+        'train_size': train_size,
+        'val_size': val_size,
+        'train_metrics': {'loss': avg_loss, 'iou': avg_iou, 'dice': avg_dice, 'acc': avg_acc},
+        'val_mixed': {'loss': val_loss_m, 'iou': val_iou_m, 'dice': val_dice_m, 'acc': val_acc_m},
+        'val_old': {'loss': val_loss_o, 'iou': val_iou_o, 'dice': val_dice_o, 'acc': val_acc_o},
+        'val_new': {'loss': val_loss_n, 'iou': val_iou_n, 'dice': val_dice_n, 'acc': val_acc_n},
+        'hparams': {
+            'encoder_lr': current_lrs[0] if len(current_lrs) > 0 else None,
+            'decoder_lr': current_lrs[1] if len(current_lrs) > 1 else None,
+            'weight_decay': optimizer.param_groups[0].get('weight_decay', None) if len(optimizer.param_groups) > 0 else None,
+            'finetune': finetune,
+            'freeze_encoder_epochs': freeze_encoder_epochs,
+            'new_ratio': new_ratio,
+            'total_epochs': total_epochs,
+            'save_interval': save_interval
+        }
+    })
+
+    # 清理旧的周期性检查点（可选）
     for i in range(save_interval, total_epochs + 1, save_interval):
         checkpoint_path = f"runs/checkpoint_epoch_{i}.pth"
         if os.path.exists(checkpoint_path):
@@ -468,29 +528,29 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # 训练总轮数（默认50）。增量/微调场景下一样生效：会从起始epoch继续到该轮数
     parser.add_argument('--epochs', type=int, default=50)
-
+    
     # 周期性保存间隔（单位：epoch）。仅用于中途检查点；训练结束会清理这些检查点
     parser.add_argument('--save_interval', type=int, default=10)
-
+    
     # 恢复训练/微调的权重路径（.pth）。可为 runs/best_model_val_iou.pth 或自定义
     parser.add_argument('--resume_from', type=str, default=None, help='checkpoint path to resume/finetune from')
-
+    
     # 是否在断点续训时一并恢复优化器状态（动量/学习率等）。仅断点续训建议开启，微调一般关闭
     parser.add_argument('--resume_optimizer', action='store_true', help='resume optimizer state when resuming')
-
+    
     # 微调模式：仅加载模型权重，重建优化器，以较小学习率在新数据上继续训练
     parser.add_argument('--finetune', action='store_true', help='finetune on new data (load weights only)')
-
+    
     # 微调学习率（默认1e-5）。与 --finetune 搭配使用
     parser.add_argument('--finetune_lr', type=float, default=1e-5, help='lr for finetune')
-
+    
     # 微调时可先冻结编码器若干轮（默认0），稳定特征再解冻。典型设置：2~5
     parser.add_argument('--freeze_encoder_epochs', type=int, default=0, help='freeze encoder for first N epochs')
-
+    
     # 统一混合训练模式：可传入多个图像/掩码目录进行合并训练（未提供 old/new 时生效）
     parser.add_argument('--image_dirs', nargs='+', type=str, default=None, help='one or more image directories')
     parser.add_argument('--mask_dirs', nargs='+', type=str, default=None, help='one or more mask directories')
-
+    
     # 分域混合训练：分别指定旧域与新域数据目录，用于“新数据为主+旧数据回放”的持续学习范式
     parser.add_argument('--old_image_dirs', nargs='+', type=str, default=None, help='old domain image dirs')
     parser.add_argument('--old_mask_dirs', nargs='+', type=str, default=None, help='old domain mask dirs')
@@ -504,7 +564,7 @@ if __name__ == "__main__":
     parser.add_argument('--encoder_lr', type=float, default=1e-5, help='learning rate for encoder (pretrained parts)')
     parser.add_argument('--decoder_lr', type=float, default=1e-4, help='learning rate for decoder (new training parts)')
     parser.add_argument('--weight_decay', type=float, default=0, help='weight decay for all parameters')
-
+    
     # 使用示例：
     # 1) 断点续训（同一数据继续训练，恢复优化器）
     #    python3 train.py --epochs 50 \

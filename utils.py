@@ -92,7 +92,7 @@ class KittiRoadDataset(Dataset):
             max_val = mask_np_dbg.max()
             mean_val = mask_np_dbg.mean()
             unique_colors = np.unique(mask_np_dbg.reshape(-1, 3), axis=0)
-            print(f"Image {idx}: mask min {min_val}, max {max_val}, mean {mean_val:.3f}, unique colors {unique_colors.tolist()}")
+            # print(f"Image {idx}: mask min {min_val}, max {max_val}, mean {mean_val:.3f}, unique colors {unique_colors.tolist()}")
 
         mask = np.array(mask)
 

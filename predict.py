@@ -163,10 +163,18 @@ def visualize_predictions(image, true_mask,
     iou1, dice1, prec1, rec1 = compute_metrics(pred1_mask, true_mask)
     iou2, dice2, prec2, rec2 = compute_metrics(pred2_mask, true_mask)
 
-    # 布局：2行4列
-    # 第一行：原图 / 真实标签 / 模型1概率图 / 模型1二值mask
-    # 第二行：模型2概率图 / 模型2二值mask / 两模型差异图 / 统计信息
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    # 计算与GT的差异图（忽略像素不计入差异）
+    gt_bin = (true_mask == 1).astype(np.uint8)
+    valid = (true_mask != 255)
+    diff_m1_gt = np.zeros_like(gt_bin)
+    diff_m2_gt = np.zeros_like(gt_bin)
+    diff_m1_gt[valid] = np.abs(pred1_mask.astype(np.uint8)[valid] - gt_bin[valid])
+    diff_m2_gt[valid] = np.abs(pred2_mask.astype(np.uint8)[valid] - gt_bin[valid])
+
+    # 布局：2行5列
+    # 第一行：原图 / 真实标签 / 模型1概率图 / 模型1二值mask / 模型1 vs GT 差异
+    # 第二行：模型2概率图 / 模型2二值mask / 模型2 vs GT 差异 / 两模型差异 / 统计信息
+    fig, axes = plt.subplots(2, 5, figsize=(24, 10), constrained_layout=True)
     
     # 第一行：原始图像和真实标签
     axes[0, 0].imshow(image)
@@ -189,6 +197,11 @@ def visualize_predictions(image, true_mask,
     axes[0, 3].set_title(f'{model1_name}\nBinary Mask')
     axes[0, 3].axis('off')
     
+    # 模型1 vs GT 差异（第一行最后一列）
+    axes[0, 4].imshow(diff_m1_gt, cmap='Reds')
+    axes[0, 4].set_title(f'{model1_name} vs GT\n(Red = Mismatch)')
+    axes[0, 4].axis('off')
+
     axes[1, 0].imshow(pred2_prob, cmap='hot')
     axes[1, 0].set_title(f'{model2_name}\nRoad Probability')
     axes[1, 0].axis('off')
@@ -196,34 +209,41 @@ def visualize_predictions(image, true_mask,
     axes[1, 1].imshow(pred2_mask, cmap='gray')
     axes[1, 1].set_title(f'{model2_name}\nBinary Mask')
     axes[1, 1].axis('off')
-    
-    # 差异对比：两个二值mask取绝对差，红色区域表示预测不一致
-    diff_mask = np.abs(pred1_mask - pred2_mask)
-    axes[1, 2].imshow(diff_mask, cmap='Reds')
-    axes[1, 2].set_title('Prediction Difference\n(Red = Different)')
+
+    # 模型2 vs GT 差异（第二行第三列）
+    axes[1, 2].imshow(diff_m2_gt, cmap='Reds')
+    axes[1, 2].set_title(f'{model2_name} vs GT\n(Red = Mismatch)')
     axes[1, 2].axis('off')
+
+    # 两模型之间差异（第二行第四列）
+    diff_mask = np.abs(pred1_mask - pred2_mask)
+    axes[1, 3].imshow(diff_mask, cmap='Reds')
+    axes[1, 3].set_title('Model1 vs Model2\n(Red = Different)')
+    axes[1, 3].axis('off')
     
     # 统计信息：面积与对GT的典型指标（意图：IoU=交并比；Dice≈F1；Prec=查准；Recall=查全）
     area1 = pred1_mask.sum()
     area2 = pred2_mask.sum()
-    axes[1, 3].text(0.08, 0.83, f'Model 1 ({model1_name})', fontsize=10, weight='bold', transform=axes[1, 3].transAxes)
-    axes[1, 3].text(0.08, 0.73, f'Area: {area1:.0f} px', fontsize=10, transform=axes[1, 3].transAxes)
-    axes[1, 3].text(0.08, 0.63, f'IoU (overlap): {iou1:.3f}', fontsize=10, transform=axes[1, 3].transAxes)
-    axes[1, 3].text(0.08, 0.53, f'Dice (F1): {dice1:.3f}', fontsize=10, transform=axes[1, 3].transAxes)
-    axes[1, 3].text(0.08, 0.43, f'Prec (precision): {prec1:.3f}', fontsize=10, transform=axes[1, 3].transAxes)
-    axes[1, 3].text(0.08, 0.33, f'Recall (coverage): {rec1:.3f}', fontsize=10, transform=axes[1, 3].transAxes)
+    # 统计信息放在第二行第五列
+    ax_stat = axes[1, 4]
+    # Model 1 block (top half)
+    ax_stat.text(0.06, 0.94, f'Model 1 ({model1_name})', fontsize=10, weight='bold', transform=ax_stat.transAxes)
+    ax_stat.text(0.06, 0.86, f'Area: {area1:.0f} px', fontsize=9, transform=ax_stat.transAxes)
+    ax_stat.text(0.06, 0.78, f'IoU (overlap): {iou1:.3f}', fontsize=9, transform=ax_stat.transAxes)
+    ax_stat.text(0.06, 0.70, f'Dice (F1): {dice1:.3f}', fontsize=9, transform=ax_stat.transAxes)
+    ax_stat.text(0.06, 0.62, f'Prec (precision): {prec1:.3f}', fontsize=9, transform=ax_stat.transAxes)
+    ax_stat.text(0.06, 0.54, f'Recall (coverage): {rec1:.3f}', fontsize=9, transform=ax_stat.transAxes)
 
-    axes[1, 3].text(0.58, 0.83, f'Model 2 ({model2_name})', fontsize=10, weight='bold', transform=axes[1, 3].transAxes)
-    axes[1, 3].text(0.58, 0.73, f'Area: {area2:.0f} px', fontsize=10, transform=axes[1, 3].transAxes)
-    axes[1, 3].text(0.58, 0.63, f'IoU (overlap): {iou2:.3f}', fontsize=10, transform=axes[1, 3].transAxes)
-    axes[1, 3].text(0.58, 0.53, f'Dice (F1): {dice2:.3f}', fontsize=10, transform=axes[1, 3].transAxes)
-    axes[1, 3].text(0.58, 0.43, f'Prec (precision): {prec2:.3f}', fontsize=10, transform=axes[1, 3].transAxes)
-    axes[1, 3].text(0.58, 0.33, f'Recall (coverage): {rec2:.3f}', fontsize=10, transform=axes[1, 3].transAxes)
-
-    axes[1, 3].text(0.08, 0.15, f'Difference: {100*diff_mask.sum()/diff_mask.size:.1f}% pixels differ', 
-                     transform=axes[1, 3].transAxes, fontsize=10, verticalalignment='top')
-    axes[1, 3].set_title('Statistics')
-    axes[1, 3].axis('off')
+    # Model 2 block (bottom half)
+    ax_stat.text(0.06, 0.38, f'Model 2 ({model2_name})', fontsize=10, weight='bold', transform=ax_stat.transAxes)
+    ax_stat.text(0.06, 0.30, f'Area: {area2:.0f} px', fontsize=9, transform=ax_stat.transAxes)
+    ax_stat.text(0.06, 0.22, f'IoU (overlap): {iou2:.3f}', fontsize=9, transform=ax_stat.transAxes)
+    ax_stat.text(0.06, 0.14, f'Dice (F1): {dice2:.3f}', fontsize=9, transform=ax_stat.transAxes)
+    ax_stat.text(0.06, 0.06, f'Prec (precision): {prec2:.3f}', fontsize=9, transform=ax_stat.transAxes)
+    ax_stat.text(0.06, 0.02, f'Recall (coverage): {rec2:.3f}', fontsize=9, transform=ax_stat.transAxes)
+    # 为可读性保留少量底部留白
+    ax_stat.set_title('Statistics')
+    ax_stat.axis('off')
     
     plt.tight_layout()
     plt.show()
@@ -249,8 +269,8 @@ def main():
         return
     
     # 选择测试图像
-    image_path = "freespace_dataset/images/0014.png"
-    mask_path = "freespace_dataset/masks/0014.png"
+    image_path = "freespace_dataset/images/0017.png"
+    mask_path = "freespace_dataset/masks/0017.png"
     
     if not os.path.exists(image_path):
         print(f"❌ 测试图像不存在: {image_path}")
@@ -303,8 +323,20 @@ def main():
     
     # 模型性能对比
     print(f"\n📊 模型性能对比:")
-    print(f"最佳验证模型 - 验证IoU: {best_checkpoint.get('val_metrics', {}).get('iou', 'N/A')}")
-    print(f"最终训练模型 - 验证IoU: {best_checkpoint.get('final_metrics', {}).get('val_iou', 'N/A')}")
+    best_val_iou = None
+    if isinstance(best_checkpoint, dict):
+        if 'val_mixed' in best_checkpoint:
+            best_val_iou = best_checkpoint['val_mixed'].get('iou', None)
+        elif 'final_metrics' in best_checkpoint:
+            best_val_iou = best_checkpoint['final_metrics'].get('val_mixed_iou', None)
+    final_val_iou = None
+    if isinstance(final_checkpoint, dict):
+        if 'final_metrics' in final_checkpoint:
+            final_val_iou = final_checkpoint['final_metrics'].get('val_mixed_iou', None)
+        elif 'val_mixed' in final_checkpoint:
+            final_val_iou = final_checkpoint['val_mixed'].get('iou', None)
+    print(f"最佳验证模型 - 验证IoU: {best_val_iou if best_val_iou is not None else 'N/A'}")
+    print(f"最终训练模型 - 验证IoU: {final_val_iou if final_val_iou is not None else 'N/A'}")
 
 if __name__ == "__main__":
     main()

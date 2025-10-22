@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from model_mobilenet_unet import MobileNetV2_UNet
+from model_mobilenet_unet_se import MobileNetV2_UNet_SE
 from utils import KittiRoadDataset
 import os
 import numpy as np
@@ -16,7 +17,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("🚀 使用设备:", device)
 
 # 初始化模型
-model = MobileNetV2_UNet().to(device)
+# model = MobileNetV2_UNet().to(device)
+model = MobileNetV2_UNet_SE().to(device)
 
 # 保存每次train的模型指标
 def _append_model_record(record: dict):
@@ -43,7 +45,8 @@ def create_optimizer_with_different_lr(model, encoder_lr=1e-5, decoder_lr=1e-4, 
     
     for name, param in model.named_parameters():
         if param.requires_grad:  # 只处理需要梯度的参数
-            if 'enc' in name:  # 编码器参数
+            # 编码器参数：包含 enc*；若使用SE版本，也包含 se_e*（编码器上的SE模块）
+            if ('enc' in name) or name.startswith('se_e'):
                 encoder_params.append(param)
             else:  # 解码器参数（up1, up2, up3, up4, final_up, out_conv）
                 decoder_params.append(param)
@@ -126,6 +129,12 @@ def freeze_encoder(model: MobileNetV2_UNet, freeze: bool):
     for m in [model.enc0, model.enc1, model.enc2, model.enc3, model.enc4, model.enc5]:
         for p in m.parameters():
             p.requires_grad = not freeze
+    # 若存在编码器侧SE模块（se_e3/e4/e5），一并按编码器策略冻结/解冻
+    for se_name in ['se_e3', 'se_e4', 'se_e5']:
+        se_module = getattr(model, se_name, None)
+        if se_module is not None:
+            for p in se_module.parameters():
+                p.requires_grad = not freeze
 
 def build_concat_dataset(image_dirs, mask_dirs, augment: bool):
     assert len(image_dirs) == len(mask_dirs), "image_dirs 与 mask_dirs 数量需一致"

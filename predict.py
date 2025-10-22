@@ -71,7 +71,7 @@ def preprocess_image(image_path, target_size=(224, 224)):
     return img_tensor, image
 
 def postprocess_prediction(pred_logits):
-    """后处理预测结果：logits -> 概率 -> 二值化mask"""
+    """后处理预测结果 logits -> 概率 -> 二值化mask"""
     # 应用softmax得到概率
     probs = torch.softmax(pred_logits, dim=1)
     

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EPOCHS=50
-SAVE_INTERVAL=10
+EPOCHS=30
+SAVE_INTERVAL=5
 
-RESUME_FROM=""
-RESUME_OPTIMIZER=false    # true to restore optimizer when resuming
-FINETUNE=false            # true to finetune with smaller LR (weights only)
-FINETUNE_LR=1e-5
-FREEZE_ENCODER_EPOCHS=0   # e.g., 2~5 for stable finetune warmup
+# 微调模式配置
+RESUME_FROM="runs/best_model_val_iou.pth"  # 使用最佳模型作为起点
+RESUME_OPTIMIZER=false                      # 微调时不恢复优化器状态
+FINETUNE=true                              # 启用微调模式
+FINETUNE_LR=5e-6                           # 微调学习率（较小）
+FREEZE_ENCODER_EPOCHS=3                    # 前3轮冻结编码器，让SE模块先学习
 
 IMAGE_DIRS=("freespace_dataset/images")
 MASK_DIRS=("freespace_dataset/masks")
@@ -19,9 +20,9 @@ NEW_IMAGE_DIRS=()
 NEW_MASK_DIRS=()
 NEW_RATIO=0.8
 
-# Layer-wise learning rates
-ENCODER_LR=1e-5
-DECODER_LR=1e-4
+# 分层学习率 - 微调时编码器用更小学习率
+ENCODER_LR=5e-7                            # 编码器学习率（更小）
+DECODER_LR=5e-6                            # 解码器学习率
 WEIGHT_DECAY=1e-4
 
 PYTHON_BIN="python3"

@@ -191,10 +191,34 @@ def train_all_data(total_epochs=50, save_interval=10, resume_from: str = None, r
     if resume_from:
         if os.path.exists(resume_from):
             ckpt = torch.load(resume_from, map_location=device)
-            if 'model_state_dict' in ckpt:
-                model.load_state_dict(ckpt['model_state_dict'])
-            else:
-                model.load_state_dict(ckpt)
+            state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
+            
+            # 部分加载：允许模型架构变化（如从原始模型迁移到SE版本）
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            
+            if missing_keys:
+                print(f"⚠️  未加载的参数（新架构新增）: {len(missing_keys)} 个")
+                if len(missing_keys) <= 10:
+                    for key in missing_keys:
+                        print(f"    - {key}")
+                else:
+                    print(f"    (显示前10个)")
+                    for key in missing_keys[:10]:
+                        print(f"    - {key}")
+                    print(f"    ... 还有 {len(missing_keys) - 10} 个")
+            
+            if unexpected_keys:
+                print(f"⚠️  旧模型中的多余参数（已忽略）: {len(unexpected_keys)} 个")
+                if len(unexpected_keys) <= 10:
+                    for key in unexpected_keys:
+                        print(f"    - {key}")
+                else:
+                    print(f"    (显示前10个)")
+                    for key in unexpected_keys[:10]:
+                        print(f"    - {key}")
+                    print(f"    ... 还有 {len(unexpected_keys) - 10} 个")
+            
+            print(f"✅ 已加载匹配的参数，新模块（如SE）将从头学习")
             
             # 重新创建优化器（使用分层学习率）
             if finetune:
